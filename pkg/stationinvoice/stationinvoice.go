@@ -41,10 +41,21 @@ type ProductCharge struct {
 	AmountUSD  float64 `json:"amount_usd"`
 }
 
+type DeviceCharge struct {
+	DeviceID    string  `json:"device_id"`
+	Description string  `json:"description"`
+	AmountUSD   float64 `json:"amount_usd"`
+}
+
 type ProductSummary struct {
-	Product  string          `json:"product"`
+	Product string `json:"product"`
+
+	// High-level summary (from "Summary per Product")
 	Charges  []ProductCharge `json:"charges,omitempty"`
 	TotalUSD float64         `json:"total_usd,omitempty"`
+
+	// Per device/SIM charges (from "Charges per Device / SIM Card")
+	Devices []DeviceCharge `json:"devices,omitempty"`
 }
 
 type UsageSummary struct {
@@ -172,7 +183,9 @@ func parseInvoice(text string) (*Invoice, error) {
 	inv.Supplier.Tel = findFirst(regexp.MustCompile(`(?m)^Tel No\.\s*:\s*(.+)\s*$`), all)
 	inv.Supplier.Email = findFirst(regexp.MustCompile(`(?m)^Email id\s*:\s*(\S+)\s*$`), all)
 
-	inv.Products = parseSummaryPerProduct(lines, inv.TotalInvoiceUSD)
+	products := parseSummaryPerProduct(lines, inv.TotalInvoiceUSD)
+	deviceCharges := parseChargesPerDeviceSIM(lines)
+	inv.Products = mergeProductDeviceCharges(products, deviceCharges)
 
 	deviceID := findFirst(regexp.MustCompile(`(?m)\b(KITP\d{8,})\b`), all)
 	if deviceID != "" {
@@ -539,4 +552,139 @@ func findNextGBLine(lines []string, start int) int {
 		}
 	}
 	return -1
+}
+
+var reKitp = regexp.MustCompile(`^KITP\d{6,}$`)
+var reNumericID = regexp.MustCompile(`^\d{6,}$`)
+
+func isDeviceIDLine(s string) bool {
+	s = strings.TrimSpace(s)
+	return reKitp.MatchString(s) || reNumericID.MatchString(s)
+}
+
+func parseChargesPerDeviceSIM(lines []string) map[string][]DeviceCharge {
+	// Map product -> device charges.
+	out := map[string][]DeviceCharge{}
+
+	// Find section starts; there can be multiple (different products) in one invoice.
+	for i := 0; i < len(lines); i++ {
+		if strings.TrimSpace(lines[i]) != "Charges per Device / SIM Card" {
+			continue
+		}
+
+		// Scan forward for blocks like "Charges for: <PRODUCT>"
+		for j := i + 1; j < min(i+800, len(lines)); j++ {
+			s := strings.TrimSpace(lines[j])
+			if s == "" {
+				continue
+			}
+			if strings.HasPrefix(s, "Summary per Product") {
+				break
+			}
+			if strings.HasPrefix(s, "Call Details") {
+				break
+			}
+			if strings.HasPrefix(s, "Charges for:") {
+				product := strings.TrimSpace(strings.TrimPrefix(s, "Charges for:"))
+				if product == "" {
+					continue
+				}
+
+				// Advance until we hit the table rows. Usually after headers "Device / SIM", "Description", maybe "Amount (USD)".
+				k := j + 1
+				for ; k < min(j+40, len(lines)); k++ {
+					h := strings.TrimSpace(lines[k])
+					if h == "" {
+						continue
+					}
+					if isDeviceIDLine(h) {
+						break
+					}
+				}
+
+				// Parse rows: deviceId, description (possibly multi-line), amount.
+				for ; k < len(lines); k++ {
+					row := strings.TrimSpace(lines[k])
+					if row == "" {
+						continue
+					}
+					if strings.HasPrefix(row, "Charges for:") || strings.HasPrefix(row, "Total charges for ") || strings.HasPrefix(row, "Total charges for this period") || strings.HasPrefix(row, "Total Invoice Amount") || strings.HasPrefix(row, "Call Details") {
+						break
+					}
+					if !isDeviceIDLine(row) {
+						continue
+					}
+
+					deviceID := row
+					descParts := []string{}
+
+					// Collect description until we find a float amount.
+					m := k + 1
+					amount := 0.0
+					foundAmount := false
+					for ; m < min(k+50, len(lines)); m++ {
+						v := strings.TrimSpace(lines[m])
+						if v == "" {
+							continue
+						}
+						if strings.HasPrefix(v, "Total charges for ") || strings.HasPrefix(v, "Charges for:") || strings.HasPrefix(v, "Total charges for this period") || strings.HasPrefix(v, "Total Invoice Amount") || strings.HasPrefix(v, "Call Details") {
+							break
+						}
+						if floatLineRe.MatchString(v) {
+							f, err := mustFloat(v)
+							if err == nil {
+								amount = f
+								foundAmount = true
+								m++
+								break
+							}
+						}
+						// stop if another device id begins unexpectedly
+						if isDeviceIDLine(v) {
+							break
+						}
+						// skip common header tokens
+						if v == "Device / SIM" || v == "Description" || v == "Amount (USD)" {
+							continue
+						}
+						descParts = append(descParts, v)
+					}
+
+					if foundAmount {
+						out[product] = append(out[product], DeviceCharge{
+							DeviceID:    deviceID,
+							Description: strings.Join(descParts, " "),
+							AmountUSD:   amount,
+						})
+					}
+
+					k = m - 1
+				}
+			}
+		}
+	}
+
+	return out
+}
+
+func mergeProductDeviceCharges(products []ProductSummary, deviceCharges map[string][]DeviceCharge) []ProductSummary {
+	byName := map[string]*ProductSummary{}
+	for i := range products {
+		p := &products[i]
+		byName[p.Product] = p
+	}
+
+	for product, devices := range deviceCharges {
+		p := byName[product]
+		if p == nil {
+			// Product wasn't present in summary table; still return it with devices.
+			np := ProductSummary{Product: product}
+			products = append(products, np)
+			p = &products[len(products)-1]
+			byName[product] = p
+		}
+		p.Devices = devices
+	}
+
+	return products
 }
